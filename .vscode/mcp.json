@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"guardrail-hub-mcp": {
+			"url": "http://localhost:8787/mcp",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}

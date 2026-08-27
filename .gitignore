@@ -1,0 +1,41 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version.local
+.venv/
+venv/
+env/
+
+# Test and coverage output
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Runtime data
+data/
+logs/
+reports/
+guardrail-runtime/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+logs/
+/public/

@@ -1,0 +1,200 @@
+name: guardrail-hub
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: docker/fastapi/Dockerfile
+    image: guardrail-mcp-server:local
+    container_name: guardrail-mcp-server
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      PATH: "/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      MCP_SERVER_PORT: "${MCP_SERVER_PORT:-8787}"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://guardrail:guardrail@postgres:5432/guardrail_hub}"
+      DYNAMODB_ENDPOINT_URL: "${DYNAMODB_ENDPOINT_URL:-}"
+      AWS_REGION: "${AWS_REGION:-ap-southeast-1}"
+    ports:
+      - "${MCP_SERVER_PORT:-8787}:${MCP_SERVER_PORT:-8787}"
+    volumes:
+      - ./app:/app/app
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./public:/app/public
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import os, urllib.request; port=os.getenv('MCP_SERVER_PORT', '8787'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health/live', timeout=5).read()"
+      interval: 300s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - app-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: guardrail-postgres
+    profiles:
+      - postgres
+      - local-db
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-guardrail_hub}"
+      POSTGRES_USER: "${POSTGRES_USER:-guardrail}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-guardrail}"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER:-guardrail}" -d "$${POSTGRES_DB:-guardrail_hub}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  zap:
+    build:
+      context: .
+      dockerfile: docker/owasp_zap/Dockerfile
+    # No container_name: fixing a name blocks `docker compose up --scale
+    # zap=N` (every replica would collide on it). Each replica gets Docker's
+    # own generated name/hostname and self-registers via that — see
+    # docker/owasp_zap/register-worker.sh.
+    profiles:
+      - zap
+    depends_on:
+      mcp-server:
+        condition: service_started
+    environment:
+      # Consumed by register-worker.sh (the entrypoint's sidecar), not by ZAP
+      # itself. There is no worker name/prefix/index here — see that script.
+      MCP_SERVER_INTERNAL_URL: "http://mcp-server:${MCP_SERVER_PORT:-8787}"
+      ZAP_API_PORT: "8080"
+      ZAP_API_KEY: "${OWASP_ZAP_API_KEY:-change-this-zap-key}"
+      ZAP_WORKER_HEARTBEAT_INTERVAL_SECONDS: "${ZAP_WORKER_HEARTBEAT_INTERVAL_SECONDS:-20}"
+      ZAP_READY_STABLE_SUCCESS_COUNT: "${ZAP_READY_STABLE_SUCCESS_COUNT:-3}"
+    command:
+      - zap.sh
+      - -addonuninstall
+      - insights
+      - -daemon
+      - -host
+      - 0.0.0.0
+      - -port
+      - "8080"
+      - -config
+      - api.key=${OWASP_ZAP_API_KEY:-change-this-zap-key}
+      - -config
+      - api.addrs.addr.name=.*
+      - -config
+      - api.addrs.addr.regex=true
+      - -config
+      - connection.timeoutInSecs=60
+      - -config
+      - api.debug=true
+      - -config
+      - network.http.maxHeaderSize=102400
+      - -config
+      - http.useragent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+    expose:
+      - "8080"
+      - "8090"
+    volumes:
+      # Anonymous (not host-path) volumes: with `--scale zap=N`, every
+      # replica needs its own working/report directory. A shared host-path
+      # bind mount here would have every replica writing to the same files.
+      - /zap/wrk
+      - /zap/reports
+    restart: unless-stopped
+    networks:
+      - app-network
+      - shared-network
+
+  # Named `jmeter-worker`, not `jmeter`, and deliberately *not* symmetrically
+  # with the `zap` service above — the asymmetry in the names records a real
+  # asymmetry in what the two containers are:
+  #
+  #   zap           = the ZAP daemon (a third-party tool) plus a registration
+  #                   sidecar. The container really is "ZAP".
+  #   jmeter-worker = our own FastAPI worker agent, which embeds the JMeter
+  #                   CLI. It owns assignment intake, the run subprocess, its
+  #                   local execution state, and its own registration and
+  #                   heartbeat. Calling it "jmeter" names the least
+  #                   interesting thing inside it.
+  #
+  # This is the same distinction ADR-0012 drew when it gave JMeter a runtime
+  # boundary (app/runtime/jmeter/) and gave ZAP none: ZAP ships a daemon we
+  # talk to, JMeter ships a CLI we host. Renaming `zap` to match would assert a
+  # symmetry that does not exist.
+  jmeter-worker:
+    build:
+      context: .
+      dockerfile: docker/jmeter/Dockerfile
+    # No container_name, for the same reason as the zap service: a fixed name
+    # blocks `docker compose up --scale jmeter-worker=N`. Each replica
+    # self-registers under its own Docker-assigned hostname — see
+    # docker/jmeter/register-worker.sh.
+    # The profile stays `jmeter`: a profile names the capability an operator is
+    # switching on, not the container that provides it, and it stays parallel
+    # to the `zap` profile.
+    profiles:
+      - jmeter
+    depends_on:
+      mcp-server:
+        condition: service_started
+    environment:
+      MCP_SERVER_INTERNAL_URL: "http://mcp-server:${MCP_SERVER_PORT:-8787}"
+      JMETER_AGENT_PORT: "8090"
+      JMETER_WORKER_HEARTBEAT_INTERVAL_SECONDS: "${JMETER_WORKER_HEARTBEAT_INTERVAL_SECONDS:-30}"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      # No JMeter version variable, deliberately: the version is pinned in
+      # docker/jmeter/Dockerfile and that image is the only source of truth
+      # for it.
+    expose:
+      - "8090"
+    volumes:
+      # Shared with mcp-server on purpose: the worker writes each run's report
+      # directly into the tree the server serves at /public/**, so there is no
+      # artifact upload step. This is what ties a worker to the same host as
+      # the server today — see JMeterRuntime._artifacts_for for the note on
+      # replacing it with an upload if workers ever run elsewhere.
+      - ./public:/app/public
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS -m 3 http://127.0.0.1:8090/health/live || exit 1
+      interval: 300s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - app-network
+      - shared-network
+
+
+networks:
+  app-network:
+    driver: bridge
+
+  shared-network:
+    external: true
+    name: guardrail-shared
+
+volumes:
+  postgres-data:

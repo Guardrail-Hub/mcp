@@ -1,0 +1,16 @@
+{
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "local-db",
+            "group": "guardrail-hub",
+            "database": "guardrail_hub",
+            "username": "guardrail",
+            "password": "guardrail"
+        }
+    ]
+}
